@@ -132,6 +132,7 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     */
 
     // -------- YOUR CODE HERE  -------- //
+    // loop over Batch Size
     for (int b = 0; b < B; b++)
     {
         // loop over Heads
@@ -151,7 +152,7 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                     for (int k = 0; k < d; k++)
                         sum += fourDimRead(Q, b, h, i, k, H, N, d) * fourDimRead(Q, b, h, j, k, H, N, d); // Q[b][h][i][k] × K[b][h][j][k]
                     // kk = K[b][h][j][k]; ^^^
-                    twoDimWrite(QK_t, i, j, N, val); // writing result back into 2D Vector
+                    twoDimWrite(QK_t, i, j, N, sum); // writing result back into 2D Vector
                 }
             }
 
@@ -168,14 +169,14 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                 for (int j = 0; j < N; j++)
                 {
                     float exponent = exp(twoDimRead(QK_T, i, j, N));
-                    twoDimWrite(QK_T, i, j, N, exponent); // writing exponent into QK^T
+                    twoDimWrite(QK_t, i, j, N, exponent); // writing exponent into QK^T
                     sum_r += exponent;
                 }
 
                 for (int j = 0; j < N; j++)
                 {
                     float exponent = twoDimRead(QK_t, i, j, N); // reading exponent value
-                    twoDimWrite(QK_T, i, j, exponent / sum_r);  // exponent / sum(exponents)
+                    twoDimWrite(QK_t, i, j, exponent / sum_r);  // exponent / sum(exponents)
                 }
             }
 
@@ -188,7 +189,7 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                     float val = 0;
                     for (int k = 0; k < N; k++)
                     {
-                        val += twoDimRead(QK_T, i, k, N) * fourDimRead(V, b, h, k, j, H, N, d);
+                        val += twoDimRead(QK_t, i, k, N) * fourDimRead(V, b, h, k, j, H, N, d);
                     }
                     fourDimWrite(O, b, h, i, j, H, N, d, val);
                 }
@@ -224,7 +225,91 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    const int TILE_N = 32; // block size for the sequence dimension (N×N)
+    const int TILE_D = 32; // block size for the feature dimension (d)
+    for (int b = 0; b < B; b++)
+    {
+        // loop over Heads
+        for (int h = 0; h < H; h++)
+        {
+            for (int i = 0; i < N; i++)
+                for (int j = 0; j < N; j++)
+                    twoDimWrite(QK_t, i, j, N, 0.0f);
+            // blocked matrix multiply
+            for (int i = 0; i < N; i += TILE_N)
+            {
+                int max_i = min(N, i + TILE_N);
+                for (int j = 0; j < N; j += TILE_N)
+                {
+                    int max_j = min(N, j + TILE_N);
+                    for (int k = 0; k < d; k += TILE_D)
+                    {
+                        int max_k = min(d, k + TILE_D);
+                        // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
+                        for (int temp_i = i; temp_i < max_i; temp_i++)
+                        {
+                            for (int temp_k = k; k < max_k; temp_k++)
+                            {
+                                float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                                for (int temp_j = j; j < max_j; j++)
+                                {
+                                    float kay = fourDimRead(K, b, h, j, k, H, N, d);
+                                    float prev = twoDimRead(QK_t, i, j, N); // accessing val of QK_t
+                                    twoDimWrite(QK_t, i, j, N, prev + q * kay);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
+            // softmax
+            for (int i = 0; i < N; i++)
+            {
+                float sum_r = 0;
+                for (int j = 0; j < N; j++)
+                {
+                    float exponent = exp(twoDimRead(QK_T, i, j, N));
+                    twoDimWrite(QK_t, i, j, N, exponent); // writing exponent into QK^T
+                    sum_r += exponent;
+                }
+
+                for (int j = 0; j < N; j++)
+                {
+                    float exponent = twoDimRead(QK_t, i, j, N); // reading exponent value
+                    twoDimWrite(QK_t, i, j, exponent / sum_r);  // exponent / sum(exponents)
+                }
+            }
+
+            // blocked matrix multiply P (N×N) × V[b,h] ------ todo
+            for (int i = 0; i < N; i += TILE_N)
+            {
+                int max_i = min(N, i + TILE_N);
+                for (int j = 0; j < N; j += TILE_N)
+                {
+                    int max_j = min(N, j + TILE_N);
+                    for (int k = 0; k < d; k += TILE_D)
+                    {
+                        int max_k = min(d, k + TILE_D);
+                        // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
+                        for (int temp_i = i; temp_i < max_i; temp_i++)
+                        {
+                            for (int temp_k = k; k < max_k; temp_k++)
+                            {
+                                float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                                for (int temp_j = j; j < max_j; j++)
+                                {
+                                    float kay = fourDimRead(K, b, h, j, k, H, N, d);
+                                    float prev = twoDimRead(QK_t, i, j, N); // accessing val of QK_t
+                                    twoDimWrite(QK_t, i, j, N, prev + q * kay);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
