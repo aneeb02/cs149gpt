@@ -232,13 +232,16 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
         // loop over Heads
         for (int h = 0; h < H; h++)
         {
+            // default values set to 0.00
             for (int i = 0; i < N; i++)
                 for (int j = 0; j < N; j++)
                     twoDimWrite(QK_t, i, j, N, 0.0f);
+
             // blocked matrix multiply
+            // three-level blocking to efficiently use small chunks in L1 cache
             for (int i = 0; i < N; i += TILE_N)
             {
-                int max_i = min(N, i + TILE_N);
+                int max_i = min(N, i + TILE_N); // for handiling 'remainder' tiles
                 for (int j = 0; j < N; j += TILE_N)
                 {
                     int max_j = min(N, j + TILE_N);
@@ -263,7 +266,7 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                 }
             }
 
-            // softmax
+            // softmax -> same as above in part 2
             for (int i = 0; i < N; i++)
             {
                 float sum_r = 0;
@@ -285,23 +288,30 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
             for (int i = 0; i < N; i += TILE_N)
             {
                 int max_i = min(N, i + TILE_N);
-                for (int j = 0; j < N; j += TILE_N)
+
+                for (int j = 0; j < d; j += TILE_D)
                 {
-                    int max_j = min(N, j + TILE_N);
-                    for (int k = 0; k < d; k += TILE_D)
+                    int max_j = min(d, j + TILE_D);
+
+                    for (int k = 0; k < N; k += TILE_N)
                     {
-                        int max_k = min(d, k + TILE_D);
+                        int max_k = min(N, k + TILE_N);
+
                         // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
                         for (int temp_i = i; temp_i < max_i; temp_i++)
                         {
                             for (int temp_k = k; k < max_k; temp_k++)
                             {
-                                float q = fourDimRead(Q, b, h, i, k, H, N, d);
+
+                                float p = twoDimRead(QK_t, temp_i, temp_k, N);
                                 for (int temp_j = j; j < max_j; j++)
                                 {
-                                    float kay = fourDimRead(K, b, h, j, k, H, N, d);
-                                    float prev = twoDimRead(QK_t, i, j, N); // accessing val of QK_t
-                                    twoDimWrite(QK_t, i, j, N, prev + q * kay);
+                                    float v = fourDimRead(V, b, h, j, k, H, N, d);
+
+                                    // adding into O matrix
+                                    float prev = fourDimRead(O, b, h, i, k, H, N, d);
+
+                                    fourDimWrite(O, b, h, i, k, H, N, d, prev + p * v); // p*v
                                 }
                             }
                         }
@@ -340,22 +350,59 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     //  You can simply access this as ORow[i]
     std::vector<float> ORow = formatTensor(ORowTensor);
 
-    // -------- YOUR CODE HERE  -------- //
-    // We give you a template of the first three loops for your convenience
+// -------- YOUR CODE HERE  -------- //
+// We give you a template of the first three loops for your convenience
+// Parallelize over batch, head, and output‐row all at once
+#pragma omp parallel for collapse(3)
     // loop over batch
     for (int b = 0; b < B; b++)
     {
-
         // loop over heads
         for (int h = 0; h < H; h++)
         {
             for (int i = 0; i < N; i++)
             {
-
                 // YRow is moved inside so each OpenMP thread gets a local copy.
                 at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(), torch::indexing::None)});
                 std::vector<float> ORow = formatTensor(ORowTensor);
                 // YOUR CODE HERE
+
+                // first compute one row of QK^t
+                for (int j = 0; j < N; j++)
+                {
+                    float temp = 0.0f;
+
+                    for (int k = 0; k < d; k++)
+                    {
+                        float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                        float k = fourDimRead(K, b, h, j, k, H, N, d);
+                        temp += q * k; // Q[ik]*K[jk]
+                    }
+                    ORow[j] = temp;
+                }
+
+                // softmax current row
+                float sum = 0.0f;
+                for (int j = 0; j < N; j++)
+                {
+                    sum += exp(ORow[j]);
+                }
+                for (int j = 0; j < N; j++)
+                {
+                    ORow[j] /= row_sum;
+                }
+
+                // multiply the softmax'd row by V to fully compute the first row of our attention output
+                for (int j = 0; j < d; j++)
+                {
+                    float temp = 0.0f;
+                    for (int k = 0; k < N; k++)
+                    {
+                        float v = fourDimRead(V, b, h, k, j, H, N, d);
+                        temp += ORow[k] * v;
+                    }
+                    fourDimWrite(O, b, h, i, j, H, N, d, temp);
+                }
             }
         }
     }
@@ -405,6 +452,156 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     std::vector<float> lnew = formatTensor(LnewTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    // blockColSize = Bc, blockRowSize = Br
+    // lines 2-5 of pseudocode
+    int Tc = (N + Bc - 1) / Bc; // Tc = N / Bc , number of column‐blocks
+    int Tr = (N + Br - 1) / Br; // Tr = N / Br , number of row‐blocks
+
+    for (int b = 0; b < B; b++)
+    {
+        for (int h = 0; h < H; h++)
+        {
+            // inserting zeros in l
+            for (int i = 0; i < N; i++)
+            {
+                l[i] = 0.0f;
+            }
+
+            // loop over column blocks
+            for (int j = 0; j < Tc; j++)
+            {
+                int j_Bc = j * Bc;
+                int bc = std::min(Bc, N - j_Bc); // actual width of block
+
+                for (int jj = 0; jj < bc; jj++)
+                {
+                    int globalCol = j_Bc + jj;
+                    for (int k = 0; k < d; k++)
+                    {
+                        float kval = fourDimRead(K, b, h, globalCol, k, H, N, d);
+                        float vval = fourDimRead(V, b, h, globalCol, k, H, N, d);
+
+                        twoDimWrite(Kj, jj, k, d, kval);
+                        twoDimWrite(Vj, jj, k, d, vval);
+                    }
+                }
+
+                //  7) Divide Q into Tr blocks Q0…QTr of size (Br × d)
+                //  10) Divide l into Tr blocks l0…lTr of size (Br)
+                //  11) Divide O into Tr blocks O0…OTr of size (Br × d)
+                // loop over row blocks
+                for (int i = 0; i < Tr; i++)
+                {
+                    int i_Br = i * Br;
+                    int br = min(Br, N - i_Br);
+
+                    // load Q_i into Qi, O_i into Oi, l_i into li
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        int globalRow = i_Br + ii;
+                        for (int index = 0; index < d; index++)
+                        {
+                            float qval = fourDimRead(Q, b, h, globalRow, index, H, N, d);
+                            float oval = fourDimRead(O, b, h, globalRow, index, H, N, d);
+                            twoDimWrite(Qi, ii, index, d, qval);
+                            twoDimWrite(Oi, ii, index, d, oval);
+                        }
+                        // copy the running normalizer
+                        li[ii] = l[globalRow];
+                    }
+
+                    // Compute Sij = QK^t
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        for (int jj = 0; jj < bc; jj++)
+                        {
+                            float mul = 0.0f;
+                            for (int k = 0; k < d; k++)
+                            {
+                                mul += twoDimRead(Qi, ii, k, d) * twoDimRead(Kj, jj, k, d);
+                            }
+                            twoDimWrite(Sij, ii, jj, bc, mul);
+                        }
+                    }
+                    // Compute Pij = exp(Sij)
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        for (int jj = 0; jj < bc; jj++)
+                        {
+                            twoDimWrite(Pij, ii, jj, bc, expf(twoDimRead(Sij, ii, jj, bc)));
+                        }
+                    }
+                    // for(int index=0;index<br*bc;index++){
+                    //     Pij[index] = exp(Sij[idx]);
+                    // }
+
+                    // Compute Lij = rowsum(Pij)
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        float sum = 0.0f;
+                        for (int jj = 0; jj < bc; jj++)
+                        {
+                            sum += twoDimRead(Pij, ii, jj, bc);
+                        }
+                        lij[ii] = sum;
+                    }
+
+                    // Compute lnew=li + lij
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        lnew[ii] = li[ii] + lij[ii];
+                    }
+
+                    // Compute Oi = (liOi + PijVj) /
+                    //   Pij*Vj
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        for (int k = 0; k < d; k++)
+                        {
+                            float mul = 0.0f;
+                            for (int jj = 0; jj < bc; jj++)
+                            {
+                                mul += Pij[ii * bc + jj] * Vj[jj * d + k];
+                            }
+                            PV[ii * d + k] = mul;
+
+                            // //read old scaled Oi
+                            // float oldOi = twoDimRead(Oi, ii, k, d);
+                            // mul = li[ii] * oldOi + mul;
+                            // // divide by the new normalizer
+                            // mul /= lnew[ii];
+                            // // write back into the local Oi tile
+                            // twoDimWrite(Oi, ii, k, d, mul);
+                        }
+                    }
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        float inv_lnew = 1.0f / lnew[ii];
+                        for (int jj = 0; jj < d; jj++)
+                        {
+                            float old = twoDimRead(Oi, ii, jj, d); // previous local Oi[ii][jj]
+                            float updated = (li[ii] * old + PV[ii * d + jj]) * inv_lnew;
+                            twoDimWrite(Oi, ii, jj, d, updated); // update local Oi
+                        }
+                    }
+
+                    //  liOi -> elementwise multiplication
+                    for (int ii = 0; ii < br; ii++)
+                    {
+                        int globalRow = i_Br + ii;
+                        for (int k = 0; k < d; k++)
+                        {
+                            float newval = twoDimRead(Oi, ii, k, d);
+                            // O[b][h][globalRow][k] = newval
+                            fourDimWrite(O, b, h, globalRow, k, H, N, d, newval);
+                        }
+                        // l[globalRow] = lnew[ii]
+                        l[globalRow] = lnew[ii];
+                    }
+                }
+            }
+        }
+    }
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
