@@ -142,7 +142,7 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
             // applying QK^t and storing into NxN temp
             for (int i = 0; i < N; i++)
                 for (int j = 0; j < N; j++)
-                    twoDimWrite(QK_T, i, j, N, 0); // setting all values to zero initially
+                    twoDimWrite(QK_t, i, j, N, 0); // setting all values to zero initially
 
             for (int i = 0; i < N; i++)
             {
@@ -168,15 +168,15 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                 float sum_r = 0;
                 for (int j = 0; j < N; j++)
                 {
-                    float exponent = exp(twoDimRead(QK_T, i, j, N));
+                    float exponent = exp(twoDimRead(QK_t, i, j, N));
                     twoDimWrite(QK_t, i, j, N, exponent); // writing exponent into QK^T
                     sum_r += exponent;
                 }
 
                 for (int j = 0; j < N; j++)
                 {
-                    float exponent = twoDimRead(QK_t, i, j, N); // reading exponent value
-                    twoDimWrite(QK_t, i, j, exponent / sum_r);  // exponent / sum(exponents)
+                    float exponent = twoDimRead(QK_t, i, j, N);   // reading exponent value
+                    twoDimWrite(QK_t, i, j, N, exponent / sum_r); // exponent / sum(exponents)
                 }
             }
 
@@ -235,19 +235,19 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
             // default values set to 0.00
             for (int i = 0; i < N; i++)
                 for (int j = 0; j < N; j++)
-                    twoDimWrite(QK_t, i, j, N, 0.0f);
+                    twoDimWrite(QK_t, i, j, N, 0);
 
             // blocked matrix multiply
             // three-level blocking to efficiently use small chunks in L1 cache
             for (int i = 0; i < N; i += TILE_N)
             {
-                int max_i = min(N, i + TILE_N); // for handiling 'remainder' tiles
+                int max_i = std::min(N, i + TILE_N); // for handiling 'remainder' tiles
                 for (int j = 0; j < N; j += TILE_N)
                 {
-                    int max_j = min(N, j + TILE_N);
+                    int max_j = std::min(N, j + TILE_N);
                     for (int k = 0; k < d; k += TILE_D)
                     {
-                        int max_k = min(d, k + TILE_D);
+                        int max_k = std::min(d, k + TILE_D);
                         // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
                         for (int temp_i = i; temp_i < max_i; temp_i++)
                         {
@@ -258,7 +258,8 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                                 {
                                     float kay = fourDimRead(K, b, h, j, k, H, N, d);
                                     float prev = twoDimRead(QK_t, i, j, N); // accessing val of QK_t
-                                    twoDimWrite(QK_t, i, j, N, prev + q * kay);
+                                    float temp_qk = prev + q * kay;
+                                    twoDimWrite(QK_t, i, j, N, temp_qk);
                                 }
                             }
                         }
@@ -272,37 +273,36 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                 float sum_r = 0;
                 for (int j = 0; j < N; j++)
                 {
-                    float exponent = exp(twoDimRead(QK_T, i, j, N));
+                    float exponent = expf(twoDimRead(QK_t, i, j, N));
                     twoDimWrite(QK_t, i, j, N, exponent); // writing exponent into QK^T
                     sum_r += exponent;
                 }
 
                 for (int j = 0; j < N; j++)
                 {
-                    float exponent = twoDimRead(QK_t, i, j, N); // reading exponent value
-                    twoDimWrite(QK_t, i, j, exponent / sum_r);  // exponent / sum(exponents)
+                    float exponent = twoDimRead(QK_t, i, j, N);   // reading exponent value
+                    twoDimWrite(QK_t, i, j, N, exponent / sum_r); // exponent / sum(exponents)
                 }
             }
 
             // blocked matrix multiply P (N×N) × V[b,h] ------ todo
             for (int i = 0; i < N; i += TILE_N)
             {
-                int max_i = min(N, i + TILE_N);
+                int max_i = std::min(N, i + TILE_N);
 
                 for (int j = 0; j < d; j += TILE_D)
                 {
-                    int max_j = min(d, j + TILE_D);
+                    int max_j = std::min(d, j + TILE_D);
 
                     for (int k = 0; k < N; k += TILE_N)
                     {
-                        int max_k = min(N, k + TILE_N);
+                        int max_k = std::min(N, k + TILE_N);
 
                         // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
                         for (int temp_i = i; temp_i < max_i; temp_i++)
                         {
                             for (int temp_k = k; k < max_k; temp_k++)
                             {
-
                                 float p = twoDimRead(QK_t, temp_i, temp_k, N);
                                 for (int temp_j = j; j < max_j; j++)
                                 {
@@ -310,8 +310,8 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
 
                                     // adding into O matrix
                                     float prev = fourDimRead(O, b, h, i, k, H, N, d);
-
-                                    fourDimWrite(O, b, h, i, k, H, N, d, prev + p * v); // p*v
+                                    prev += p * v;
+                                    fourDimWrite(O, b, h, i, k, H, N, d, prev); // p*v
                                 }
                             }
                         }
@@ -389,7 +389,7 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                 }
                 for (int j = 0; j < N; j++)
                 {
-                    ORow[j] /= row_sum;
+                    ORow[j] /= sum;
                 }
 
                 // multiply the softmax'd row by V to fully compute the first row of our attention output
@@ -493,7 +493,7 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                 for (int i = 0; i < Tr; i++)
                 {
                     int i_Br = i * Br;
-                    int br = min(Br, N - i_Br);
+                    int br = std::min(Br, N - i_Br);
 
                     // load Q_i into Qi, O_i into Oi, l_i into li
                     for (int ii = 0; ii < br; ii++)
