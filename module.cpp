@@ -21,7 +21,7 @@ inline float twoDimRead(std::vector<float> &tensor, int &x, int &y, const int &s
     return tensor[x * (sizeX) + y];
 }
 
-inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &sizeX, float &val)
+inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &sizeX, float val)
 {
     tensor[x * (sizeX) + y] = val;
 }
@@ -36,7 +36,7 @@ inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int
 }
 
 inline void fourDimWrite(std::vector<float> &tensor, int &x, int &y, int &z, int &b,
-                         const int &sizeX, const int &sizeY, const int &sizeZ, float &val)
+                         const int &sizeX, const int &sizeY, const int &sizeZ, float val)
 {
     // return;
     tensor[x * (sizeX * sizeY * sizeZ) + y * (sizeY * sizeZ) + z * (sizeZ) + b] = val;
@@ -375,8 +375,8 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
                     for (int k = 0; k < d; k++)
                     {
                         float q = fourDimRead(Q, b, h, i, k, H, N, d);
-                        float k = fourDimRead(K, b, h, j, k, H, N, d);
-                        temp += q * k; // Q[ik]*K[jk]
+                        float kval = fourDimRead(K, b, h, j, k, H, N, d);
+                        temp += q * kval; // Q[ik]*K[jk]
                     }
                     ORow[j] = temp;
                 }
