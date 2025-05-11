@@ -251,15 +251,15 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                         // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
                         for (int temp_i = i; temp_i < max_i; temp_i++)
                         {
-                            for (int temp_k = k; k < max_k; temp_k++)
+                            for (int temp_k = k; temp_k < max_k; temp_k++)
                             {
                                 float q = fourDimRead(Q, b, h, i, k, H, N, d);
-                                for (int temp_j = j; j < max_j; j++)
+                                for (int temp_j = j; temp_j < max_j; j++)
                                 {
-                                    float kay = fourDimRead(K, b, h, j, k, H, N, d);
-                                    float prev = twoDimRead(QK_t, i, j, N); // accessing val of QK_t
+                                    float kay = fourDimRead(K, b, h, temp_j, temp_k, H, N, d);
+                                    float prev = twoDimRead(QK_t, temp_i, temp_j, N); // accessing val of QK_t
                                     float temp_qk = prev + q * kay;
-                                    twoDimWrite(QK_t, i, j, N, temp_qk);
+                                    twoDimWrite(QK_t, temp_i, temp_j, N, temp_qk);
                                 }
                             }
                         }
