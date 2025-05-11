@@ -225,8 +225,8 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
-    const int TILE_N = 32; // block size for the sequence dimension (N×N)
-    const int TILE_D = 32; // block size for the feature dimension (d)
+    const int TILE_N = 16; // block size for the sequence dimension (N×N)
+    const int TILE_D = 16; // block size for the feature dimension (d)
     for (int b = 0; b < B; b++)
     {
         // loop over Heads
@@ -301,17 +301,17 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                         // multiplying TILE_N×TILE_D block of Q by the TILE_D×TILE_N block of K^T
                         for (int temp_i = i; temp_i < max_i; temp_i++)
                         {
-                            for (int temp_k = k; k < max_k; temp_k++)
+                            for (int temp_k = k; temp_k < max_k; temp_k++)
                             {
                                 float p = twoDimRead(QK_t, temp_i, temp_k, N);
-                                for (int temp_j = j; j < max_j; j++)
+                                for (int temp_j = j; temp_j < max_j; j++)
                                 {
-                                    float v = fourDimRead(V, b, h, j, k, H, N, d);
+                                    float v = fourDimRead(V, b, h, temp_j, temp_k, H, N, d);
 
                                     // adding into O matrix
-                                    float prev = fourDimRead(O, b, h, i, k, H, N, d);
+                                    float prev = fourDimRead(O, b, h, temp_i, temp_k, H, N, d);
                                     prev += p * v;
-                                    fourDimWrite(O, b, h, i, k, H, N, d, prev); // p*v
+                                    fourDimWrite(O, b, h, temp_i, temp_k, H, N, d, prev); // p*v
                                 }
                             }
                         }
