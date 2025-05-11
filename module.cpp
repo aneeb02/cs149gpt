@@ -253,7 +253,7 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
                         {
                             for (int temp_k = k; temp_k < max_k; temp_k++)
                             {
-                                float q = fourDimRead(Q, b, h, i, k, H, N, d);
+                                float q = fourDimRead(Q, b, h, temp_i, temp_k, H, N, d);
                                 for (int temp_j = j; temp_j < max_j; j++)
                                 {
                                     float kay = fourDimRead(K, b, h, temp_j, temp_k, H, N, d);
